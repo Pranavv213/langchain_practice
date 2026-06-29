@@ -1,142 +1,74 @@
-import uuid
 from dataclasses import dataclass
-from langchain_openai import ChatOpenAI
+from typing_extensions import TypedDict
 from langchain.agents import create_agent
-from langchain_core.tools import tool
-from langchain.tools import ToolRuntime
-from langgraph.checkpoint.memory import InMemorySaver
+from langchain.tools import ToolRuntime, tool
+from langchain_core.runnables import Runnable
 from langgraph.store.memory import InMemoryStore
-from langgraph.store.base import IndexConfig
 
-# ==========================================
-# 1. DEFINE RUNTIME DEPENDENCIES (NO HARDCODING)
-# ==========================================
-
-# Define the Context data structure. 
-# This dictates what details MUST be attached whenever an agent run executes.
+# 1. Define the Runtime Context
 @dataclass
-class UserContext:
+class Context:
     user_id: str
-    application_context: str = "coding_assistant"
 
+# 2. Define structured input for saving data
+class UserInfo(TypedDict):
+    name: str
 
-# ==========================================
-# 2. CREATE TRULY DYNAMIC TOOLS
-# ==========================================
+# 3. Create a single, shared Memory Store
+shared_store = InMemoryStore()
+
+# 4. Define the Tools
+@tool
+def save_user_info(user_info: UserInfo, runtime: ToolRuntime[Context]) -> str:
+    """Save user info to the store."""
+    assert runtime.store is not None
+    user_id = runtime.context.user_id
+    
+    # Store the extracted data into the namespace ("users",)
+    runtime.store.put(("users",), user_id, dict(user_info))
+    return f"Successfully saved user info for {user_id}."
 
 @tool
-def save_user_preference(preference: str, runtime: ToolRuntime[UserContext]) -> str:
-    """
-    Call this tool when the user explicitly states a long-term preference, rule, 
-    or fact about themselves (e.g., programming language choices, brief explanations).
-    """
-    # 🌟 DYNAMIC READ: Absolutely no hardcoded user strings.
-    # The runtime pulls whichever user is actively running this thread.
+def get_user_info(runtime: ToolRuntime[Context]) -> str:
+    """Look up user info from the store."""
+    assert runtime.store is not None
     user_id = runtime.context.user_id
-    app_context = runtime.context.application_context
-    namespace = (user_id, app_context)
     
-    # Safely write to long-term memory
-    existing_item = runtime.store.get(namespace, "user_preferences")
-    current_rules = existing_item.value.get("rules", []) if existing_item else []
-    
-    if preference not in current_rules:
-        current_rules.append(preference)
-        
-    runtime.store.put(namespace, "user_preferences", {"rules": current_rules})
-    return f"Successfully learned and saved preference for user '{user_id}'"
+    # Retrieve data from the same namespace
+    user_info = runtime.store.get(("users",), user_id)
+    return str(user_info.value) if user_info else "Unknown user"
 
+# 5. Initialize the Agent with both tools
+agent: Runnable = create_agent(
+    model="ollama:north-mini-code-1.0",
+    tools=[save_user_info, get_user_info],
+    store=shared_store,  # Inject the shared store
+    context_schema=Context,
+)
 
 # ==========================================
-# 3. CONSTRUCT THE ENGINE
+# STEP 1: Extract and Save Name from Message
 # ==========================================
-
-model = ChatOpenAI(model="gpt-4o", temperature=0.2)
-def mock_embed(text: str) -> list[float]: return [0.1, 0.2]
-
-# Shared storage instances (would normally map to Postgres / Redis in production)
-global_store = InMemoryStore(index=IndexConfig(embed=mock_embed, dims=2))
-global_checkpointer = InMemorySaver()
-
-# Set up the agent blueprint
-agent = create_agent(
-    model=model,
-    tools=[save_user_preference], 
-    store=global_store,      
-    checkpointer=global_checkpointer,
-    context_schema=UserContext  # ◄ Forces the agent runtime to accommodate this schema
+print("--- STEP 1: Agent extracts 'Alice' and saves it ---")
+save_result = agent.invoke(
+    {"messages": [{"role": "user", "content": "Hi! My name is Alice, please remember that."}]},
+    context=Context(user_id="user_abc"),
 )
-
+print(f"Agent Output: {save_result}\n")
 
 # ==========================================
-# 4. EXECUTION SIMULATION (PASSING DATA DYNAMICALLY)
+# STEP 2: Retrieve Name from Store via Agent
 # ==========================================
-
-def run_chat_pipeline(incoming_user_id: str, message: str, incoming_thread_id: str = None):
-    """
-    Acts like your production API endpoint. It accepts parameters externally 
-    and handles thread/context setup entirely dynamically.
-    """
-    # Dynamic Thread Generation: If none is passed, it assumes a "New Chat" window
-    active_thread_id = incoming_thread_id or f"thread_{uuid.uuid4().hex[:8]}"
-    
-    # Dynamic Config Mapping
-    config = {"configurable": {"thread_id": active_thread_id}}
-    
-    # Dynamic Context Injection
-    runtime_context = UserContext(user_id=incoming_user_id)
-    
-    # Fire Agent Execution
-    response = agent.invoke(
-        {"messages": [{"role": "user", "content": message}]},
-        config=config,
-        context=runtime_context
-    )
-    
-    return {
-        "reply": response["messages"][-1].content,
-        "thread_id": active_thread_id
-    }
-
-
-# --- PRODUCTION SIMULATION RUNS ---
-
-print("=== SCENARIO 1: Alice opens a brand new chat window ===")
-# She triggers a conversation with no thread_id passed.
-res1 = run_chat_pipeline(
-    incoming_user_id="alice_dev_99", 
-    message="Hey, write code blocks in Python from now on."
+print("--- STEP 2: Agent retrieves the name from the store ---")
+retrieve_result = agent.invoke(
+    {"messages": [{"role": "user", "content": "What is my name?"}]},
+    context=Context(user_id="user_abc"),
 )
-print(f"Generated Thread ID: {res1['thread_id']}")
-print(f"AI Response: {res1['reply']}\n")
+print(f"Agent Output: {retrieve_result}\n")
 
-
-print("=== SCENARIO 2: Alice sends a message in the SAME chat window ===")
-# The frontend sends back the generated Thread ID to preserve short-term chat window state
-res2 = run_chat_pipeline(
-    incoming_user_id="alice_dev_99", 
-    message="Can you give me a template to read an array?", 
-    incoming_thread_id=res1['thread_id'] # Injected dynamically
-)
-print(f"AI Response (Short Term Context Maintained):\n{res2['reply']}\n")
-
-
-print("=== SCENARIO 3: Bob logs in entirely separately ===")
-# Bob has a completely different ID and a clean slate thread.
-res3 = run_chat_pipeline(
-    incoming_user_id="bob_manager_01", 
-    message="Can you give me a template to read an array?"
-)
-print(f"Generated Thread ID: {res3['thread_id']}")
-print(f"AI Response to Bob: {res3['reply']}\n")
-
-
-print("=== SCENARIO 4: Alice returns next week in a NEW thread ===")
-# Alice starts a brand new conversation channel (None thread_id). 
-# Let's check if her long-term rules persist across system boundaries.
-res4 = run_chat_pipeline(
-    incoming_user_id="alice_dev_99", 
-    message="Can you give me a basic array reading template?"
-)
-print(f"Generated Thread ID: {res4['thread_id']}")
-print(f"AI Response (Long Term Store Retrieved):\n{res4['reply']}\n")
+# ==========================================
+# STEP 3: Verification (Direct Access)
+# ==========================================
+print("--- STEP 3: Double checking the store directly ---")
+direct_check = shared_store.get(("users",), "user_abc")
+print(f"Direct Store Value: {direct_check.value if direct_check else 'Empty'}")
